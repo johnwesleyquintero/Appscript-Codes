@@ -113,8 +113,8 @@ function refreshPPCInsights() {
   for (const key in tMap) {
     const clk = tMap[key].clk;
     const imp = tMap[key].imp;
-    output.push([key, imp, clk, tagPerformance(clk, 0, 0, 0)]);
-    // ^ V1: click-signal only. Replace 0s with real orders/acos/roas for V2.
+    output.push([key, imp, clk, tagPerformance(clk, 0, 0)]);
+    // ^ V1: click-signal only. Replace 0s with real orders/roas for V2.
   }
 
   output.push([""]);
@@ -146,8 +146,8 @@ function refreshPPCInsights() {
   for (const key in pMap) {
     const clk = pMap[key].clk;
     const imp = pMap[key].imp;
-    output.push([key, imp, clk, tagPerformance(clk, 0, 0, 0)]);
-    // ^ V1: click-signal only. Replace 0s with real orders/acos/roas for V2.
+    output.push([key, imp, clk, tagPerformance(clk, 0, 0)]);
+    // ^ V1: click-signal only. Replace 0s with real orders/roas for V2.
   }
 
   output.push([""]);
@@ -182,16 +182,27 @@ function refreshPPCInsights() {
 
 /**
  * Tags a targeting/placement row as WIN, NEUTRAL, or LOSE.
- * V1: behavior-based on clicks + orders only.
- * V2 (future): wire in real ACOS/ROAS from targeting-level attribution.
  *
- * 🟢 WIN     — ≥1 order AND (ROAS ≥ 2 OR ACOS ≤ 40%)
- * 🔴 LOSE    — ≥5 clicks AND 0 orders (spend with no signal)
- * 🟡 NEUTRAL — everything else (observing)
+ * V1: behavior-based (clicks + orders). ACOS dropped — not available at
+ *     targeting level until search-term attribution is wired in (V2).
+ *
+ * 🟢 WIN     — ≥1 order OR ROAS ≥ 2 (confirmed revenue signal)
+ * 🔴 LOSE    — ≥10 clicks AND 0 orders (clear waste threshold)
+ * 🟡 NEUTRAL — everything else (exploration / insufficient data)
+ *
+ * Why ≥10 clicks for LOSE:
+ *   Amazon traffic buckets (close-match, rest-of-search, etc.) are mixed-intent
+ *   containers, not isolated experiments. A low-click count is insufficient
+ *   signal to call waste — it mislabels top-funnel exploration as failure.
+ *
+ * @param {number} clicks  - Total clicks for this row
+ * @param {number} orders  - Total orders attributed (0 in V1)
+ * @param {number} roas    - Return on ad spend (0 in V1)
+ * @returns {string} Emoji tag: 🟢 WIN / 🔴 LOSE / 🟡 NEUTRAL
  */
-function tagPerformance(clicks, orders, acos, roas) {
-  if (orders >= 1 && (roas >= 2 || acos <= 40)) return "🟢 WIN";
-  if (clicks >= 5 && orders === 0)               return "🔴 LOSE";
+function tagPerformance(clicks, orders, roas) {
+  if (orders >= 1 || roas >= 2)        return "🟢 WIN";
+  if (clicks >= 10 && orders === 0)    return "🔴 LOSE";
   return "🟡 NEUTRAL";
 }
 
