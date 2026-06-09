@@ -5,6 +5,20 @@ Format: [Project] vX.X — Description
 
 ---
 
+## [PPC_Reports] v2.4 — 2026-06-09
+### Added
+- **`PPC_Tracker` sheet**: auto-created with bold frozen header row on first run — never overwrites, always appends
+- **`logPPCSnapshot()`**: appends one timestamped row per run with 10 metrics (Date, Impressions, Clicks, Orders, Sales, Spend, CTR%, CVR%, ACOS%, ROAS)
+- **`logSnapshotOnly()`**: standalone function to log without re-rendering the Insights tab — useful for scheduled triggers
+- **Menu separator + 📸 Log Snapshot Only** item added to ⚙️ PPC OPS menu
+- **Auto-logging on refresh**: `refreshPPCInsights()` now calls `logPPCSnapshot()` automatically on every run
+
+### Notes
+- `PPC_Tracker` is pivot-ready — filter by date range, chart ROAS over time, or export for analysis
+- Run `logSnapshotOnly` daily via Apps Script time-trigger for trend data without touching the Insights view
+
+---
+
 ## [PPC_Reports] v2.3 — 2026-06-09
 ### Fixed
 - **LOSE threshold raised**: `clicks >= 5` → `clicks >= 10` — prevents mislabeling high-volume exploration traffic (close-match, rest-of-search) as waste
