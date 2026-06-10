@@ -10,10 +10,35 @@ Reads raw Amazon report exports directly from Google Sheets tabs and compresses 
 | Section | Output |
 |---------|--------|
 | **Metrics** | Impressions, Clicks, Orders, Sales, Spend, CTR%, CVR%, ACOS%, ROAS |
-| **Priority Actions** | Top N financially impactful actions (SCALE/CUT) with Confidence |
-| **Targeting Summary** | Per-keyword/ASIN performance + 🟢/🟡/🔴 tag |
-| **Placement Summary** | Per-placement performance + 🟢/🟡/🔴 tag |
+| **Priority Actions** | Top N financially impactful actions (SCALE/CUT) with Confidence and Recommended Bids |
+| **Budget Recycling** | Saved waste budget from CUT targets reallocated to top SCALE winners |
+| **Targeting Summary** | Per-keyword/ASIN performance + 🟢/🟡/🔴 tag + Recommended Bid |
+| **Placement Summary** | Per-placement performance + 🟢/🟡/🔴 tag + Recommended Bid |
+| **Keyword Harvesting** | Scans Search Terms report for winners (to scale) and losers (to Negate), complete with CPC and Recommended Bids |
 | **Diagnostics** | CTR low, CVR strong, ROAS profitable, low data warnings, waste alerts |
+
+---
+
+## ⚡ Rule-Based Bid Action Layer (v1)
+
+The system automatically calculates recommended bid adjustments based on performance tags and current average CPC:
+
+- **🟢 WIN + ROAS > 3.0** → `+20%` Bid increase (aggressive scaling)
+- **🟢 WIN + ROAS 2.0 to 3.0** → `+10%` Bid increase (controlled scaling)
+- **🟢 WIN + ROAS 1.0 to 2.0** → `HOLD` (maintain current bid)
+- **🟢 WIN + ROAS < 1.0** → `-20%` Bid decrease (efficiency throttle)
+- **🔴 LOSE** (Waste clicks) → `-20%` Bid decrease or PAUSE
+- **🔴 HIGH IMPRESSION NO CLICK** (Creative failure) → `-20%` Bid decrease or PAUSE
+- **🟡 NEUTRAL** (Insufficient data) → `HOLD` (monitoring phase)
+
+---
+
+## ♻️ Budget Recycling Loop
+
+Surfaces a self-healing budget distribution mechanism within the Executive Summary:
+1. **Saved Spend**: Accumulates the raw spend of all targets matching the `🔴 CUT` action threshold.
+2. **Reallocation Pool**: Creates a recycling budget from 50% of the saved waste spend.
+3. **Suggested Redistribution**: Disperses the budget equally to up to the top 3 highest-impact `🟢 SCALE` targets (ranked by performance score), ensuring saved budget immediately funds proven winners.
 
 ---
 
@@ -24,9 +49,9 @@ Each performance tag is now accompanied by a **Confidence Score** (LOW, MED, HIG
 
 | Tag | Condition | Confidence |
 |-----|-----------|------------|
-| 🟢 WIN | `clicks >= MIN_CLICKS_FOR_SIGNAL` AND `spend >= MIN_SPEND_FOR_SIGNAL` AND (`orders >= 1` OR `ROAS >= WIN_ROAS`) | LOW (2-7 clicks), MED (8-19 clicks), HIGH (20+ clicks) |
+| 🟢 WIN | `clicks >= MIN_CLICKS_FOR_SIGNAL` AND `spend >= MIN_SPEND_FOR_SIGNAL` AND (`orders >= 1` OR `ROAS >= WIN_ROAS`) | LOW (2-4 clicks), MED (5-19 clicks), HIGH (20+ clicks) |
 | 🔴 HIGH IMPRESSION NO CLICK | `impressions >= HIGH_IMP_THRESHOLD` AND `clicks === 0` | LOW (always, due to 0 clicks) |
-| 🔴 LOSE | `clicks >= WASTE_CLICKS` AND `orders === 0` | LOW (2-7 clicks), MED (8-19 clicks), HIGH (20+ clicks) |
+| 🔴 LOSE | `clicks >= WASTE_CLICKS` AND `orders === 0` | LOW (2-4 clicks), MED (5-19 clicks), HIGH (20+ clicks) |
 | 🟡 NEUTRAL | Everything else — observing | LOW (always, due to insufficient data) |
 
 **Priority Queue Scoring:**
@@ -41,22 +66,27 @@ Your Google Sheet must have these tabs (exact names):
 | Tab Name | Source |
 |----------|--------|
 | `PPC_Insights` | Output tab (auto-created content, must exist) |
+| `PPC_Harvest` | Keyword/Search Term Output tab (auto-created content) |
 | `Sponsored_Products_Campaign_report` | Amazon Campaign report export |
 | `Sponsored_Products_Targeting_re` | Amazon Targeting report export |
 | `Sponsored_Products_Placement_re` | Amazon Placement report export |
+| `Sponsored_Products_Search_term_` or `Sponsored_Products_Search_term_re` | Amazon Customer Search Term report export |
 
 ---
 
 ## 📋 Required Column Headers
 
 **Campaign report:**
-- `Impressions`, `Clicks`, `Spend`, `7 Day Total Orders (#)`, `7 Day Total Sales `
+- `Impressions`, `Clicks`, `Spend`, `7 Day Total Orders (#)`, `7 Day Total Sales`
 
 **Targeting report:**
 - `Targeting`, `Impressions`, `Clicks`
 
 **Placement report:**
 - `Placement`, `Impressions`, `Clicks`
+
+**Search Term report:**
+- `Customer Search Term`, `Campaign Name`, `Ad Group Name`, `Impressions`, `Clicks`, `Spend`, `7 Day Total Orders (#)`, `7 Day Total Sales`
 
 ---
 
@@ -76,8 +106,8 @@ Your Google Sheet must have these tabs (exact names):
 - [x] V2 — Targeting-level order attribution (search term merge)
 - [x] Action Layer — Auto bid recommendations (Decision Engine with Priority Queue)
 - [x] Confidence Scoring (LOW/MED/HIGH)
+- [x] Learning Loop (trend memory, predictive tagging)
 - [ ] Budget Rebalancer (suggested budget shifts)
-- [ ] Learning Loop (trend memory, predictive tagging)
 - [ ] Multi-campaign rollup
 - [ ] Weekly snapshot logging
 

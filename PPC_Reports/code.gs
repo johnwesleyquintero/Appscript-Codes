@@ -14,8 +14,24 @@ const PPC_RULES = {
   HIGH_IMP_THRESHOLD: 1000, // Impressions with 0 clicks = Creative failure
   TOP_ACTION_COUNT: 5,      // How many priority actions to show
   WASTE_SPEND_THRESHOLD: 5, // Spend threshold for search term alerts
-  CONF_MED_CLICKS: 8,       // Clicks required for Medium confidence
-  CONF_HIGH_CLICKS: 20      // Clicks required for High confidence
+  CONF_MED_CLICKS: 5,       // Lowered to 5 to be more aggressive/responsive
+  CONF_HIGH_CLICKS: 20,     // Clicks required for High confidence
+  
+  // Harvest Logic Thresholds (newly added for aggressive harvesting)
+  SCALE_ROAS_THRESHOLD: 2.0,
+  TEST_SCALE_ROAS_MIN: 1.3,
+  TEST_SCALE_CTR_THRESHOLD: 1.0, // Percentage
+
+  // Bid Adjustment Rules
+  BID_SCALE_HIGH_ROAS: 3.0,     // ROAS threshold for +20% bid adjustment
+  BID_SCALE_MED_ROAS: 2.0,      // ROAS threshold for +10% bid adjustment
+  BID_SCALE_LOW_ROAS: 1.0,      // ROAS threshold for hold
+  BID_CUT_FACTOR: 0.80,         // -20% bid for lose/waste targets
+  BID_SCALE_HIGH_FACTOR: 1.20,  // +20% bid
+  BID_SCALE_MED_FACTOR: 1.10,   // +10% bid
+  
+  // Budget Recycling Loop
+  REALLOCATION_PERCENT: 0.50    // Redistribute 50% of saved waste budget to winners
 };
 
 /**
@@ -56,17 +72,13 @@ function refreshPPCInsights() {
   // Collect all output rows in memory, write to sheet once at the end
   const wasteList = [];    // For Diagnostics
   let totalWasteSpend = 0;
+  let totalCutWasteSpend = 0; // Spend saved by cutting waste
   let scaleCount = 0;
   let cutCount = 0;
   let holdCount = 0;
 
   const priorityQueue = []; // Actions to be ranked by impact
-  // Helper to validate headers
-  const getIdx = (headers, col) => {
-    const i = headers.indexOf(col);
-    if (i === -1) throw new Error(`Column "${col}" not found. Check your Amazon export format.`);
-    return i;
-  };
+  const scaleCandidates = []; // Track high confidence SCALE targets for budget recycling
 
   const output = [];
 
@@ -93,11 +105,11 @@ function refreshPPCInsights() {
   let impressions = 0, clicks = 0, spend = 0, orders = 0, sales = 0;
 
   for (let i = 1; i < cData.length; i++) {
-    impressions += Number(cData[i][cImp])    || 0;
-    clicks      += Number(cData[i][cClicks]) || 0;
-    spend       += parseMoney(cData[i][cSpend]);
-    orders      += Number(cData[i][cOrders]) || 0;
-    sales       += parseMoney(cData[i][cSales]);
+    impressions += parseNumber(cData[i][cImp]);
+    clicks      += parseNumber(cData[i][cClicks]);
+    spend       += parseNumber(cData[i][cSpend]);
+    orders      += parseNumber(cData[i][cOrders]);
+    sales       += parseNumber(cData[i][cSales]);
   }
 
   const ctr  = impressions ? (clicks / impressions) * 100 : 0;
@@ -118,6 +130,8 @@ function refreshPPCInsights() {
   output.push(["ROAS",        roas.toFixed(2)]);
   output.push([""]);
   output.push([""]);
+  // Calculate campaign metrics for snapshot logger
+  const campaignMetrics = { impressions, clicks, orders, sales, spend, ctr, cvr, acos, roas };
 
   // =========================
   // TARGETING (NORMALIZED)
@@ -138,19 +152,20 @@ function refreshPPCInsights() {
     const key = tData[i][tKey];
     if (!key) continue;
     if (!tMap[key]) tMap[key] = { imp: 0, clk: 0, spd: 0, ord: 0, sal: 0 };
-    tMap[key].imp += Number(tData[i][tImp])    || 0;
-    tMap[key].clk += Number(tData[i][tClk])    || 0;
-    tMap[key].spd += parseMoney(tData[i][tSpd]);
-    tMap[key].ord += Number(tData[i][tOrd])    || 0;
-    tMap[key].sal += parseMoney(tData[i][tSal]);
+    tMap[key].imp += parseNumber(tData[i][tImp]);
+    tMap[key].clk += parseNumber(tData[i][tClk]);
+    tMap[key].spd += parseNumber(tData[i][tSpd]);
+    tMap[key].ord += parseNumber(tData[i][tOrd]);
+    tMap[key].sal += parseNumber(tData[i][tSal]);
   }
 
   output.push(["TARGETING SUMMARY"]);
-  output.push(["Targeting", "Impressions", "Clicks", "Tag", "Action"]);
+  output.push(["Targeting", "Impressions", "Clicks", "Tag", "Action", "Current CPC", "Suggested Bid"]);
 
   for (const key in tMap) {
     const { imp, clk, spd, ord, sal } = tMap[key];
     const roas = spd ? sal / spd : 0;
+    const cpc = clk ? spd / clk : 0;
     const { tag, confidence } = tagPerformance({ 
       clicks: clk, 
       orders: ord, 
@@ -160,19 +175,26 @@ function refreshPPCInsights() {
     });
     const action = getSuggestedAction(tag);
     const score = (sal * 2) - spd;
+    const bidRec = calculateBidAdjustment(tag, roas, cpc);
 
     // Decision Counting
     if (action === "PROTECT / SCALE") {
       scaleCount++;
-      if (confidence !== "LOW") priorityQueue.push({ score, type: "SCALE", msg: `Target: ${key} (${ord} ord, ${confidence} conf)` });
+      if (confidence !== "LOW") {
+        priorityQueue.push({ score, type: "SCALE", msg: `Target: ${key} (${ord} ord, ${confidence} conf) → Suggest Bid: $${bidRec.bid ? bidRec.bid.toFixed(2) : "—"}` });
+        scaleCandidates.push({ key: `Target: ${key}`, score, ord });
+      }
     } else if (action === "NEGATE / PAUSE") {
       cutCount++;
-      if (confidence !== "LOW") priorityQueue.push({ score, type: "CUT", msg: `Target: ${key} ($${spd.toFixed(2)} waste, ${confidence} conf)` });
+      if (confidence !== "LOW") {
+        totalCutWasteSpend += spd; // Accumulate budget being cut
+        priorityQueue.push({ score, type: "CUT", msg: `Target: ${key} ($${spd.toFixed(2)} waste, ${confidence} conf) → Suggest Bid: $${bidRec.bid ? bidRec.bid.toFixed(2) : "—"}` });
+      }
     } else {
       holdCount++;
     }
 
-    output.push([key, imp, clk, `${tag} [${confidence}]`, action]);
+    output.push([key, imp, clk, `${tag} [${confidence}]`, action, cpc ? `$${cpc.toFixed(2)}` : "—", bidRec.text]);
     if (ord === 0) totalWasteSpend += spd;
   }
 
@@ -198,19 +220,20 @@ function refreshPPCInsights() {
     const key = pData[i][pKey];
     if (!key) continue;
     if (!pMap[key]) pMap[key] = { imp: 0, clk: 0, spd: 0, ord: 0, sal: 0 };
-    pMap[key].imp += Number(pData[i][pImp])    || 0;
-    pMap[key].clk += Number(pData[i][pClk])    || 0;
-    pMap[key].spd += parseMoney(pData[i][pSpd]);
-    pMap[key].ord += Number(pData[i][pOrd])    || 0;
-    pMap[key].sal += parseMoney(pData[i][pSal]);
+    pMap[key].imp += parseNumber(pData[i][pImp]);
+    pMap[key].clk += parseNumber(pData[i][pClk]);
+    pMap[key].spd += parseNumber(pData[i][pSpd]);
+    pMap[key].ord += parseNumber(pData[i][pOrd]);
+    pMap[key].sal += parseNumber(pData[i][pSal]);
   }
 
   output.push(["PLACEMENT SUMMARY"]);
-  output.push(["Placement", "Impressions", "Clicks", "Tag", "Action"]);
+  output.push(["Placement", "Impressions", "Clicks", "Tag", "Action", "Current CPC", "Suggested Bid"]);
 
   for (const key in pMap) {
     const { imp, clk, spd, ord, sal } = pMap[key];
     const roas = spd ? sal / spd : 0;
+    const cpc = clk ? spd / clk : 0;
     const { tag, confidence } = tagPerformance({ 
       clicks: clk, 
       orders: ord, 
@@ -220,16 +243,23 @@ function refreshPPCInsights() {
     });
     const action = getSuggestedAction(tag);
     const score = (sal * 2) - spd;
+    const bidRec = calculateBidAdjustment(tag, roas, cpc);
 
     if (action === "PROTECT / SCALE") {
       scaleCount++;
-      if (confidence !== "LOW") priorityQueue.push({ score, type: "SCALE", msg: `Placement: ${key} (${ord} ord, ${confidence} conf)` });
+      if (confidence !== "LOW") {
+        priorityQueue.push({ score, type: "SCALE", msg: `Placement: ${key} (${ord} ord, ${confidence} conf) → Suggest Bid: $${bidRec.bid ? bidRec.bid.toFixed(2) : "—"}` });
+        scaleCandidates.push({ key: `Placement: ${key}`, score, ord });
+      }
     } else if (action === "NEGATE / PAUSE") {
       cutCount++;
-      if (confidence !== "LOW") priorityQueue.push({ score, type: "CUT", msg: `Placement: ${key} ($${spd.toFixed(2)} waste, ${confidence} conf)` });
+      if (confidence !== "LOW") {
+        totalCutWasteSpend += spd;
+        priorityQueue.push({ score, type: "CUT", msg: `Placement: ${key} ($${spd.toFixed(2)} waste, ${confidence} conf) → Suggest Bid: $${bidRec.bid ? bidRec.bid.toFixed(2) : "—"}` });
+      }
     }
 
-    output.push([key, imp, clk, `${tag} [${confidence}]`, action]);
+    output.push([key, imp, clk, `${tag} [${confidence}]`, action, cpc ? `$${cpc.toFixed(2)}` : "—", bidRec.text]);
   }
 
   output.push([""]);
@@ -249,23 +279,24 @@ function refreshPPCInsights() {
   const sSal = getIdx(sHeaders, "7 Day Total Sales");
 
   output.push(["TOP SEARCH TERMS (BY SPEND)"]);
-  output.push(["Term", "Spend", "Orders", "Tag", "Action"]);
+  output.push(["Term", "Spend", "Orders", "Tag", "Action", "Current CPC", "Suggested Bid"]);
 
   // Sort search terms by spend to find waste/wins quickly
   const sortedST = sData.slice(1)
     .map(row => ({
       term: row[sKey],
-      imp:  Number(row[sImp]) || 0,
-      clk:  Number(row[sClk]) || 0,
-      spd:  parseMoney(row[sSpd]),
-      ord:  Number(row[sOrd]) || 0,
-      sal:  parseMoney(row[sSal])
+      imp:  parseNumber(row[sImp]),
+      clk:  parseNumber(row[sClk]),
+      spd:  parseNumber(row[sSpd]),
+      ord:  parseNumber(row[sOrd]),
+      sal:  parseNumber(row[sSal])
     }))
     .sort((a, b) => b.spd - a.spd)
     .slice(0, 15);
 
   sortedST.forEach(st => {
     const roas = st.spd ? st.sal / st.spd : 0;
+    const cpc = st.clk ? st.spd / st.clk : 0;
     const { tag, confidence } = tagPerformance({ 
       clicks: st.clk, 
       orders: st.ord, 
@@ -275,16 +306,19 @@ function refreshPPCInsights() {
     });
     const action = getSuggestedAction(tag);
     const score = (st.sal * 2) - st.spd;
+    const bidRec = calculateBidAdjustment(tag, roas, cpc);
 
-    output.push([st.term, st.spd.toFixed(2), st.ord, `${tag} [${confidence}]`, action]);
+    output.push([st.term, st.spd.toFixed(2), st.ord, `${tag} [${confidence}]`, action, cpc ? `$${cpc.toFixed(2)}` : "—", bidRec.text]);
 
     if (tag.includes("🔴") && confidence !== "LOW") {
        wasteList.push(st.term);
+       totalCutWasteSpend += st.spd;
        if (st.spd > PPC_RULES.WASTE_SPEND_THRESHOLD) {
-         priorityQueue.push({ score, type: "CUT", msg: `Term: ${st.term} ($${st.spd.toFixed(2)} waste, ${confidence} conf)` });
+         priorityQueue.push({ score, type: "CUT", msg: `Term: ${st.term} ($${st.spd.toFixed(2)} waste, ${confidence} conf) → Suggest Bid: $${bidRec.bid ? bidRec.bid.toFixed(2) : "—"}` });
        }
     } else if (tag.includes("🟢") && confidence !== "LOW") {
-      priorityQueue.push({ score, type: "SCALE", msg: `Term: ${st.term} (${st.ord} ord, ${confidence} conf)` });
+      priorityQueue.push({ score, type: "SCALE", msg: `Term: ${st.term} (${st.ord} ord, ${confidence} conf) → Suggest Bid: $${bidRec.bid ? bidRec.bid.toFixed(2) : "—"}` });
+      scaleCandidates.push({ key: `Term: ${st.term}`, score, ord: st.ord });
     }
   });
 
@@ -308,6 +342,28 @@ function refreshPPCInsights() {
   const totalDecisions = scaleCount + cutCount + holdCount;
   const holdPct = totalDecisions ? ((holdCount / totalDecisions) * 100).toFixed(0) : 0;
 
+  // Budget Recycling Loop calculation
+  const budgetPool = totalCutWasteSpend * PPC_RULES.REALLOCATION_PERCENT;
+  const sortedScaleCandidates = scaleCandidates.sort((a, b) => b.score - a.score);
+  const recycleCount = Math.min(3, sortedScaleCandidates.length);
+  const budgetPerTarget = recycleCount > 0 ? (budgetPool / recycleCount) : 0;
+
+  const recyclingMsgRows = [
+    ["♻️ BUDGET RECYCLING LOOP"],
+    [`Saved Waste Spend (from CUT targets): $${totalCutWasteSpend.toFixed(2)}`],
+    [`Reallocation Pool (${(PPC_RULES.REALLOCATION_PERCENT * 100).toFixed(0)}%): $${budgetPool.toFixed(2)}`]
+  ];
+  
+  if (recycleCount > 0) {
+    recyclingMsgRows.push([`Suggested Redistribution: Allocate +$${budgetPerTarget.toFixed(2)} spend budget to each of these top ${recycleCount} winners:`]);
+    for (let i = 0; i < recycleCount; i++) {
+      recyclingMsgRows.push([`   - ${sortedScaleCandidates[i].key} (${sortedScaleCandidates[i].ord} ord)`]);
+    }
+  } else {
+    recyclingMsgRows.push(["Suggested Redistribution: No active SCALE priority winners to receive reallocated budget."]);
+  }
+  recyclingMsgRows.push([""]);
+
   // Rank priorities by financial impact (Sales for SCALE, Spend for CUT)
   const topActions = priorityQueue
     .sort((a, b) => b.score - a.score)
@@ -323,7 +379,8 @@ function refreshPPCInsights() {
     [`🟢 SCALE: ${scaleCount} targets`],
     [`🔴 CUT: ${cutCount} targets`],
     [`🟡 HOLD: ${holdPct}% of inventory`],
-    [""]
+    [""],
+    ...recyclingMsgRows
   ];
   output.unshift(...execHeader);
 
@@ -337,26 +394,82 @@ function refreshPPCInsights() {
   // =========================
   detectDeltas(ss, tMap, pMap).forEach(r => output.push(r));
 
+  // Find max columns to keep the range perfectly rectangular and prevent truncation
+  const maxCols = output.reduce((max, r) => Math.max(max, r.length), 1);
+
   // =========================
   // SINGLE WRITE — much faster than row-by-row
   // =========================
   insightsSheet
-    .getRange(1, 1, output.length, 5)
+    .getRange(1, 1, output.length, maxCols)
     .setValues(output.map(r => {
-      // Pad each row to 5 columns so the range is rectangular
-      while (r.length < 5) r.push("");
+      // Pad each row to maxCols columns so the range is rectangular
+      while (r.length < maxCols) r.push("");
       return r;
     }));
-
   // Log a snapshot to PPC_Tracker for trend analysis
-  logPPCSnapshot(ss, { impressions, clicks, orders, sales, spend, ctr, cvr, acos, roas });
-
+  logPPCSnapshot(ss, campaignMetrics);
   SpreadsheetApp.getUi().alert("✅ PPC Insights refreshed and snapshot logged!");
 }
 
 // =========================
 // HELPERS
 // =========================
+
+/**
+ * Calculates a rule-based recommended bid adjustment based on performance tag, ROAS, and current CPC.
+ * 
+ * Rules:
+ * - tag "🟢 WIN" with ROAS > 3.0: +20% adjustment to current CPC
+ * - tag "🟢 WIN" with ROAS 2.0 to 3.0: +10% adjustment to current CPC
+ * - tag "🟢 WIN" with ROAS 1.0 to 2.0: Hold (no action)
+ * - tag "🟢 WIN" with ROAS < 1.0: -20% adjustment to current CPC
+ * - tag "🔴 LOSE": -20% adjustment to current CPC
+ * - tag "🔴 HIGH IMPRESSION NO CLICK": -20% adjustment to current CPC
+ * - tag "🟡 NEUTRAL": Hold (no action)
+ * 
+ * @param {string} tag
+ * @param {number} roas
+ * @param {number} cpc
+ * @returns {Object} { action: string, bid: number|null, text: string }
+ */
+function calculateBidAdjustment(tag, roas, cpc) {
+  if (!cpc || cpc <= 0) {
+    return { action: "HOLD", bid: null, text: "—" };
+  }
+
+  let factor = 1.0;
+  let actionText = "HOLD";
+
+  if (tag.includes("WIN")) {
+    if (roas > PPC_RULES.BID_SCALE_HIGH_ROAS) {
+      factor = PPC_RULES.BID_SCALE_HIGH_FACTOR;
+      actionText = "+20%";
+    } else if (roas >= PPC_RULES.BID_SCALE_MED_ROAS && roas <= PPC_RULES.BID_SCALE_HIGH_ROAS) {
+      factor = PPC_RULES.BID_SCALE_MED_FACTOR;
+      actionText = "+10%";
+    } else if (roas >= PPC_RULES.BID_SCALE_LOW_ROAS && roas < PPC_RULES.BID_SCALE_MED_ROAS) {
+      factor = 1.0;
+      actionText = "HOLD";
+    } else if (roas < PPC_RULES.BID_SCALE_LOW_ROAS) {
+      factor = PPC_RULES.BID_CUT_FACTOR;
+      actionText = "-20%";
+    }
+  } else if (tag.includes("LOSE") || tag.includes("HIGH IMPRESSION")) {
+    factor = PPC_RULES.BID_CUT_FACTOR;
+    actionText = "-20%";
+  } else {
+    factor = 1.0;
+    actionText = "HOLD";
+  }
+
+  const suggestedBid = Number((cpc * factor).toFixed(2));
+  return {
+    action: actionText,
+    bid: suggestedBid,
+    text: actionText === "HOLD" ? "HOLD" : `${actionText} ($${suggestedBid.toFixed(2)})`
+  };
+}
 
 /**
  * Tags a targeting/placement/search-term row as WIN, NEUTRAL, or LOSE.
@@ -421,12 +534,22 @@ function getSuggestedAction(tag) {
 }
 
 /**
- * Strips $ signs and commas from Amazon money strings and returns a number.
- * e.g. "$1,234.56" → 1234.56
+ * Centralized parser to handle Amazon report values (currency, percentages, commas).
+ * Strips symbols and returns a valid number.
  */
-function parseMoney(value) {
-  if (!value) return 0;
-  return Number(String(value).replace(/\$/g, "").replace(/,/g, "")) || 0;
+function parseNumber(value) {
+  if (value == null || value === "") return 0;
+  const clean = String(value).replace(/[$,%]/g, "").replace(/,/g, "");
+  return Number(clean) || 0;
+}
+
+/**
+ * Helper to validate headers and find their index.
+ */
+function getIdx(headers, col) {
+  const i = headers.indexOf(col);
+  if (i === -1) throw new Error(`Column "${col}" not found. Check your Amazon export format.`);
+  return i;
 }
 
 // =========================
@@ -475,6 +598,77 @@ function logPPCSnapshot(ss, m) {
     Number(m.acos.toFixed(2)),
     Number(m.roas.toFixed(2))
   ]);
+}
+
+/**
+ * Analyzes the PPC_Tracker for recent campaign-level trends.
+ * This serves as the "Learning Loop" for trend memory and predictive diagnostics.
+ *
+ * Tracker column layout:
+ *   0=Date, 1=Impressions, 2=Clicks, 3=Orders, 4=Sales,
+ *   5=Spend, 6=CTR%, 7=CVR%, 8=ACOS%, 9=ROAS
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @returns {Object} An object summarizing recent trends (e.g., { roas: 'improving', acos: 'stable' }).
+ */
+function getCampaignTrends(ss) {
+  const tracker = ss.getSheetByName("PPC_Tracker");
+  const trends = {};
+
+  if (!tracker) {
+    return trends; // No tracker, no trends
+  }
+
+  const data = tracker.getDataRange().getValues();
+  // Need at least 3 data rows (header + 2 snapshots) to detect a trend over 2 periods
+  if (data.length < 3) {
+    return trends;
+  }
+
+  // Look at the last N snapshots for trend analysis.
+  // Using 3 snapshots means we compare (S3 vs S2) and (S2 vs S1).
+  const numSnapshotsForTrend = 3;
+  // Slice from `1` to exclude header row.
+  const recentSnapshots = data.slice(Math.max(data.length - numSnapshotsForTrend, 1));
+
+  if (recentSnapshots.length < 2) {
+      return trends; // Not enough data for a trend (e.g., only 1 snapshot after header)
+  }
+
+  // Helper to determine trend for a specific metric column
+  // Returns 'consistently_improving', 'consistently_declining', 'mixed', 'stable', or 'insufficient_data'
+  const analyzeMetricTrend = (colIndex, isHigherBetter) => {
+    if (recentSnapshots.length < 2) return 'insufficient_data';
+
+    let improvingCount = 0;
+    let decliningCount = 0;
+
+    for (let i = 0; i < recentSnapshots.length - 1; i++) {
+      const val1 = Number(recentSnapshots[i][colIndex]) || 0;
+      const val2 = Number(recentSnapshots[i+1][colIndex]) || 0;
+
+      if (val2 > val1) {
+        improvingCount++;
+      } else if (val2 < val1) {
+        decliningCount++;
+      }
+    }
+
+    if (improvingCount === recentSnapshots.length - 1) {
+      return isHigherBetter ? 'consistently_improving' : 'consistently_declining';
+    } else if (decliningCount === recentSnapshots.length - 1) {
+      return isHigherBetter ? 'consistently_declining' : 'consistently_improving';
+    } else if (improvingCount > 0 || decliningCount > 0) {
+      return 'mixed';
+    }
+    return 'stable';
+  };
+
+  trends.roas = analyzeMetricTrend(9, true);  // ROAS (col 9, higher better)
+  trends.acos = analyzeMetricTrend(8, false); // ACOS (col 8, lower better)
+  trends.orders = analyzeMetricTrend(3, true); // Orders (col 3, higher better)
+
+  return trends;
 }
 
 // =========================
@@ -610,10 +804,115 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("⚙️ PPC OPS")
     .addItem("🔄 Run PPC Insights",   "refreshPPCInsights")
+    .addItem("🌱 Generate Harvest List", "generateHarvestReport")
     .addSeparator()
     .addItem("📸 Log Snapshot Only",  "logSnapshotOnly")
     .addItem("🔍 Delta Check",          "runDeltaCheck")
     .addToUi();
+}
+
+/**
+ * Phase 1 Execution Layer: Keyword Harvesting
+ * Scans Search Term report for Winners (to Scale) and Losers (to Negate).
+ * Outputs to a dedicated "PPC_Harvest" sheet.
+ */
+function generateHarvestReport() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const HARVEST_TAB = "PPC_Harvest";
+  
+  const searchtermSheet = ss.getSheetByName("Sponsored_Products_Search_term_") || ss.getSheetByName("Sponsored_Products_Search_term_re");
+  
+  if (!searchtermSheet) {
+    throw new Error("Missing Search Term report tab.");
+  }
+
+  let harvestSheet = ss.getSheetByName(HARVEST_TAB);
+  if (!harvestSheet) {
+    harvestSheet = ss.insertSheet(HARVEST_TAB);
+  }
+  harvestSheet.clearContents();
+
+  const sData    = searchtermSheet.getDataRange().getValues();
+  const sHeaders = sData[0].map(h => String(h).trim());
+
+  const sKey   = getIdx(sHeaders, "Customer Search Term");
+  const sCamp  = getIdx(sHeaders, "Campaign Name");
+  const sGroup = getIdx(sHeaders, "Ad Group Name");
+  const sImp   = getIdx(sHeaders, "Impressions");
+  const sClk   = getIdx(sHeaders, "Clicks");
+  const sSpd   = getIdx(sHeaders, "Spend");
+  const sOrd   = getIdx(sHeaders, "7 Day Total Orders (#)");
+  const sSal   = getIdx(sHeaders, "7 Day Total Sales");
+
+  const harvestOutput = [
+    ["Keyword / Search Term", "Source Campaign", "Ad Group", "Clicks", "Orders", "ROAS", "Confidence", "Current CPC", "Suggested Bid Action", "Suggested Bid", "Suggested Match Type"]
+  ];
+
+  for (let i = 1; i < sData.length; i++) {
+    const row = sData[i];
+    const term = row[sKey];
+    if (!term || term.startsWith("*") || term.startsWith("b0")) continue; // Skip ASINs or empty terms
+
+    const clk  = parseNumber(row[sClk]);
+    const ord  = parseNumber(row[sOrd]);
+    const spd  = parseNumber(row[sSpd]);
+    const sal  = parseNumber(row[sSal]);
+    const imp  = parseNumber(row[sImp]);
+    const roas = spd ? sal / spd : 0;
+    const cpc  = clk ? spd / clk : 0;
+
+    const { tag, confidence } = tagPerformance({ 
+      clicks: clk, 
+      orders: ord, 
+      roas, 
+      impressions: imp, 
+      spend: spd 
+    });
+
+    let action = "";
+    let match  = "";
+    const bidRec = calculateBidAdjustment(tag, roas, cpc);
+
+    if (tag === "🟢 WIN") {
+      action = (confidence === "LOW") ? "POTENTIAL WIN (WATCH)" : "PROXIMITY SCALE (HARVEST)";
+      match  = "Exact";
+    } else if (tag === "🔴 LOSE" || tag === "🔴 HIGH IMPRESSION NO CLICK") {
+      action = (confidence === "LOW") ? "POTENTIAL WASTE (WATCH)" : "NEGATE / BLOCK";
+      match  = "Negative Exact";
+    } else {
+      // Skip true Neutrals to keep the harvest sheet focused on actionable signals
+      continue;
+    }
+
+    harvestOutput.push([
+      term, 
+      row[sCamp], 
+      row[sGroup], 
+      clk, 
+      ord, 
+      roas.toFixed(2), 
+      confidence, 
+      cpc ? `$${cpc.toFixed(2)}` : "—",
+      bidRec.action,
+      bidRec.bid ? `$${bidRec.bid.toFixed(2)}` : "—",
+      match
+    ]);
+  }
+
+  if (harvestOutput.length > 1) {
+    harvestSheet.getRange(1, 1, harvestOutput.length, harvestOutput[0].length)
+      .setValues(harvestOutput);
+    
+    // Formatting
+    harvestSheet.getRange(1, 1, 1, harvestOutput[0].length).setFontWeight("bold").setBackground("#f3f3f3");
+    harvestSheet.setFrozenRows(1);
+    
+    SpreadsheetApp.getUi().alert(`✅ Harvest complete! Found ${harvestOutput.length - 1} items in 'PPC_Harvest'. Check the Confidence column for signals.`);
+  } else {
+    SpreadsheetApp.getUi().alert("ℹ️ Harvest complete: No Wins or Losers found (even at Low confidence).");
+  }
+  
+  ss.setActiveSheet(harvestSheet);
 }
 
 /**
@@ -625,26 +924,26 @@ function logSnapshotOnly() {
   const campaignSheet  = ss.getSheetByName("Sponsored_Products_Campaign_report");
 
   if (!campaignSheet) {
-    throw new Error("Missing tab: Sponsored_Products_Campaign_report");
+    throw new Error("Missing tab: Sponsored_Products_Campaign_report.");
   }
 
   const cData    = campaignSheet.getDataRange().getValues();
   const cHeaders = cData[0].map(h => String(h).trim());
 
-  const cImp    = cHeaders.indexOf("Impressions");
-  const cClicks = cHeaders.indexOf("Clicks");
-  const cSpend  = cHeaders.indexOf("Spend");
-  const cOrders = cHeaders.indexOf("7 Day Total Orders (#)");
-  const cSales  = cHeaders.indexOf("7 Day Total Sales");
+  const cImp    = getIdx(cHeaders, "Impressions");
+  const cClicks = getIdx(cHeaders, "Clicks");
+  const cSpend  = getIdx(cHeaders, "Spend");
+  const cOrders = getIdx(cHeaders, "7 Day Total Orders (#)");
+  const cSales  = getIdx(cHeaders, "7 Day Total Sales");
 
   let impressions = 0, clicks = 0, spend = 0, orders = 0, sales = 0;
 
   for (let i = 1; i < cData.length; i++) {
-    impressions += Number(cData[i][cImp])    || 0;
-    clicks      += Number(cData[i][cClicks]) || 0;
-    spend       += parseMoney(cData[i][cSpend]);
-    orders      += Number(cData[i][cOrders]) || 0;
-    sales       += parseMoney(cData[i][cSales]);
+    impressions += parseNumber(cData[i][cImp]);
+    clicks      += parseNumber(cData[i][cClicks]);
+    spend       += parseNumber(cData[i][cSpend]);
+    orders      += parseNumber(cData[i][cOrders]);
+    sales       += parseNumber(cData[i][cSales]);
   }
 
   const ctr  = impressions ? (clicks / impressions) * 100 : 0;
@@ -674,8 +973,8 @@ function runDeltaCheck() {
   // Build tMap (Targeting Map) for the attribution engine
   const tData = targetingSheet.getDataRange().getValues();
   const tHeaders = tData[0].map(h => String(h).trim());
-  const tKey = tHeaders.indexOf("Targeting");
-  const tClk = tHeaders.indexOf("Clicks");
+  const tKey = getIdx(tHeaders, "Targeting");
+  const tClk = getIdx(tHeaders, "Clicks");
 
   const tMap = {};
   for (let i = 1; i < tData.length; i++) {
@@ -688,9 +987,9 @@ function runDeltaCheck() {
 
   // Build pMap (Placement Map) for the attribution engine
   const pData = placementSheet.getDataRange().getValues();
-  const pHeaders = pData[0].map(h => String(h).trim());
-  const pKey = pHeaders.indexOf("Placement");
-  const pClk = pHeaders.indexOf("Clicks");
+  const pHeaders = pData[0].map(h => String(h).trim()); // Already trimmed in getIdx
+  const pKey = getIdx(pHeaders, "Placement");
+  const pClk = getIdx(pHeaders, "Clicks");
 
   const pMap = {};
   for (let i = 1; i < pData.length; i++) {
